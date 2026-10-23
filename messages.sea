@@ -1,0 +1,261 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/messages — sending messages: text, media, location, contacts,
+-- reactions, interactive (buttons, lists, CTA URL, location request, flows),
+-- templates, read receipts and the typing indicator.
+--
+-- Every send_* method returns the Graph API answer:
+--   {messaging_product = "whatsapp", contacts = [{input, wa_id}], messages = [{id}]}
+-- or an error value. Most take a final opts table with:
+--   reply_to  id of the message being answered (shown as a quote)
+--   biz_opaque_callback_data  string echoed back in the status webhooks
+
+local util = require("./util")
+
+local M = {}
+
+local MAX_BUTTONS = 3
+local MAX_LIST_ROWS = 10
+
+-- client:send(message [, opts]) → data|error
+-- Sends a message object: `to` and `type` plus the field named by type, e.g.
+-- {to = "5511999999999", type = "text", text = {body = "hi"}}.
+-- messaging_product and recipient_type are added.
+function M.send(self, message, opts)
+    local phone_id = self:require_phone()?
+    if message.to == nil then return error("whatsapp: message.to is required") end
+    local m = {}
+    m.messaging_product = "whatsapp"
+    m.recipient_type = "individual"
+    util.merge(m, message)
+    m.to = util.phone(message.to)
+    if opts ~= nil then
+        if opts.reply_to ~= nil then
+            local ctx = {}
+            ctx.message_id = opts.reply_to
+            m.context = ctx
+        end
+        util.put(m, "biz_opaque_callback_data", opts.biz_opaque_callback_data)
+        util.put(m, "recipient_type", opts.recipient_type)
+    end
+    return self:post(phone_id .. "/messages", m)
+end
+
+-- client:send_text(to, body [, opts]) → data|error
+-- opts.preview_url = true renders a preview of the first URL in body.
+function M.send_text(self, to, body, opts)
+    local text = {}
+    text.body = body
+    if opts ~= nil and opts.preview_url then text.preview_url = true end
+    return self:send({to = to, type = "text", text = text}, opts)
+end
+
+local function send_media(self, kind, to, media, extra, opts)
+    local m = {}
+    m.to = to
+    m.type = kind
+    m[kind] = util.media_object(media, extra)
+    return self:send(m, opts)
+end
+
+-- client:send_image(to, media [, opts]) → data|error
+-- media: a URL, an uploaded media id, or {id|link}. opts.caption.
+function M.send_image(self, to, media, opts)
+    return send_media(self, "image", to, media, {caption = opts and opts.caption}, opts)
+end
+
+-- client:send_video(to, media [, opts]) → data|error
+-- opts.caption.
+function M.send_video(self, to, media, opts)
+    return send_media(self, "video", to, media, {caption = opts and opts.caption}, opts)
+end
+
+-- client:send_audio(to, media [, opts]) → data|error
+function M.send_audio(self, to, media, opts)
+    return send_media(self, "audio", to, media, nil, opts)
+end
+
+-- client:send_document(to, media [, opts]) → data|error
+-- opts.caption, opts.filename (shown to the recipient).
+function M.send_document(self, to, media, opts)
+    return send_media(self, "document", to, media, {caption = opts and opts.caption, filename = opts and opts.filename}, opts)
+end
+
+-- client:send_sticker(to, media [, opts]) → data|error
+-- A .webp sticker (static ≤ 100 KB, animated ≤ 500 KB).
+function M.send_sticker(self, to, media, opts)
+    return send_media(self, "sticker", to, media, nil, opts)
+end
+
+-- client:send_location(to, location [, opts]) → data|error
+-- location: {latitude, longitude [, name] [, address]}.
+function M.send_location(self, to, location, opts)
+    if location == nil or location.latitude == nil or location.longitude == nil then
+        return error("whatsapp: location.latitude and location.longitude are required")
+    end
+    return self:send({to = to, type = "location", location = util.merge({}, location)}, opts)
+end
+
+-- client:send_contacts(to, contacts [, opts]) → data|error
+-- contacts: an array of contact cards in the Cloud API format, e.g.
+-- [{name = {formatted_name = "Ana", first_name = "Ana"}, phones = [{phone = "+55 11 99999-9999", type = "CELL"}]}].
+function M.send_contacts(self, to, contacts, opts)
+    if contacts == nil or len(contacts) == 0 then return error("whatsapp: at least one contact is required") end
+    return self:send({to = to, type = "contacts", contacts = contacts}, opts)
+end
+
+-- client:send_reaction(to, message_id, emoji [, opts]) → data|error
+-- An empty emoji ("") removes the reaction.
+function M.send_reaction(self, to, message_id, emoji, opts)
+    return self:send({to = to, type = "reaction", reaction = {message_id = message_id, emoji = emoji}}, opts)
+end
+
+-- client:send_interactive(to, interactive [, opts]) → data|error
+-- Sends a raw interactive object ({type, header, body, footer, action}).
+function M.send_interactive(self, to, interactive, opts)
+    return self:send({to = to, type = "interactive", interactive = interactive}, opts)
+end
+
+-- header: a string (text header) or a header object ({type = "image", image = {link = ...}}).
+local function build_interactive(kind, body, opts)
+    local i = {}
+    i.type = kind
+    if body ~= nil then i.body = {text = body} end
+    if opts ~= nil then
+        if type(opts.header) == "string" then
+            i.header = {type = "text", text = opts.header}
+        elseif opts.header ~= nil then
+            i.header = opts.header
+        end
+        if opts.footer ~= nil then i.footer = {text = opts.footer} end
+    end
+    return i
+end
+
+-- client:send_buttons(to, body, buttons [, opts]) → data|error
+-- Up to 3 reply buttons. buttons: an array of {id, title} or of strings
+-- (used as both id and title; titles have at most 20 characters).
+-- opts: header (string or header object), footer, reply_to.
+function M.send_buttons(self, to, body, buttons, opts)
+    if buttons == nil or len(buttons) == 0 or len(buttons) > MAX_BUTTONS then
+        return error(`whatsapp: send_buttons takes 1 to ${MAX_BUTTONS} buttons`)
+    end
+    local list_ = []
+    for _, b in buttons do
+        local id = b
+        local title = b
+        if type(b) ~= "string" then
+            id = b.id
+            title = b.title
+        end
+        list_[] = {type = "reply", reply = {id = tostring(id), title = title}}
+    end
+    local i = build_interactive("button", body, opts)
+    i.action = {buttons = list_}
+    return self:send_interactive(to, i, opts)
+end
+
+-- client:send_list(to, body, button_text, sections [, opts]) → data|error
+-- A list message. sections: an array of {title, rows = [{id, title [, description]}]}
+-- (at most 10 rows in total). opts: header (text only), footer, reply_to.
+function M.send_list(self, to, body, button_text, sections, opts)
+    if sections == nil or len(sections) == 0 then return error("whatsapp: send_list needs at least one section") end
+    local rows = 0
+    local out = []
+    for _, s in sections do
+        local srows = []
+        for _, r in s.rows or [] do
+            local row = {}
+            row.id = tostring(r.id)
+            row.title = r.title
+            util.put(row, "description", r.description)
+            srows[] = row
+        end
+        rows += len(srows)
+        local sec = {}
+        util.put(sec, "title", s.title)
+        sec.rows = srows
+        out[] = sec
+    end
+    if rows == 0 or rows > MAX_LIST_ROWS then
+        return error(`whatsapp: send_list takes 1 to ${MAX_LIST_ROWS} rows in total`)
+    end
+    local i = build_interactive("list", body, opts)
+    i.action = {button = button_text, sections = out}
+    return self:send_interactive(to, i, opts)
+end
+
+-- client:send_cta_url(to, body, display_text, url [, opts]) → data|error
+-- A message with a single button that opens url. opts: header, footer, reply_to.
+function M.send_cta_url(self, to, body, display_text, url, opts)
+    local i = build_interactive("cta_url", body, opts)
+    i.action = {name = "cta_url", parameters = {display_text = display_text, url = url}}
+    return self:send_interactive(to, i, opts)
+end
+
+-- client:send_location_request(to, body [, opts]) → data|error
+-- Asks the user to share their location (answered by a "location" message).
+function M.send_location_request(self, to, body, opts)
+    local i = build_interactive("location_request_message", body, opts)
+    i.action = {name = "send_location"}
+    return self:send_interactive(to, i, opts)
+end
+
+-- client:send_flow(to, body, flow [, opts]) → data|error
+-- Opens a WhatsApp Flow. flow: {id | name, cta, token [, mode ("published"|"draft")]
+-- [, action ("navigate"|"data_exchange")] [, screen] [, data]}.
+-- opts: header, footer, reply_to.
+function M.send_flow(self, to, body, flow, opts)
+    local params = {}
+    params.flow_message_version = "3"
+    util.put(params, "flow_id", flow.id)
+    util.put(params, "flow_name", flow.name)
+    util.put(params, "flow_cta", flow.cta)
+    util.put(params, "flow_token", flow.token)
+    util.put(params, "mode", flow.mode)
+    params.flow_action = flow.action or "navigate"
+    if flow.screen ~= nil or flow.data ~= nil then
+        local payload = {}
+        util.put(payload, "screen", flow.screen)
+        util.put(payload, "data", flow.data)
+        params.flow_action_payload = payload
+    end
+    local i = build_interactive("flow", body, opts)
+    i.action = {name = "flow", parameters = params}
+    return self:send_interactive(to, i, opts)
+end
+
+-- client:send_template(to, name, language [, components [, opts]]) → data|error
+-- A template message (needed to start a conversation outside the 24 h window).
+-- language: a code like "pt_BR" or "en_US". components: an array built with
+-- whatsapp.template (body, header, button helpers) or in the raw Cloud API format.
+function M.send_template(self, to, name, language, components, opts)
+    local t = {}
+    t.name = name
+    t.language = {code = language or "en_US"}
+    if components ~= nil and len(components) > 0 then t.components = components end
+    return self:send({to = to, type = "template", template = t}, opts)
+end
+
+-- client:mark_read(message_id [, opts]) → data|error
+-- Marks a received message (and the ones before it) as read: blue ticks.
+-- opts.typing = true also shows the typing indicator to the user (until
+-- you answer, or for up to 25 seconds).
+function M.mark_read(self, message_id, opts)
+    local phone_id = self:require_phone()?
+    local m = {}
+    m.messaging_product = "whatsapp"
+    m.status = "read"
+    m.message_id = message_id
+    if opts ~= nil and opts.typing then m.typing_indicator = {type = "text"} end
+    return self:post(phone_id .. "/messages", m)
+end
+
+-- client:typing(message_id) → data|error
+-- Shows the typing indicator in answer to message_id (it also marks it read).
+function M.typing(self, message_id)
+    return self:mark_read(message_id, {typing = true})
+end
+
+return M

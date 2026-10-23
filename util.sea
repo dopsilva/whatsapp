@@ -1,0 +1,97 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/util — small helpers shared by the whatsapp modules
+
+local M = {}
+
+-- util.put(t, key, value) → t
+-- Sets t[key] only when value is not nil (assigning nil to a table key
+-- would keep the key and encode it as JSON null).
+function M.put(t, key, value)
+    if value ~= nil then t[key] = value end
+    return t
+end
+
+-- util.merge(dst, src) → dst
+-- Copies every non-nil field of src into dst.
+function M.merge(dst, src)
+    if src == nil then return dst end
+    for k, v in src do
+        if v ~= nil then dst[k] = v end
+    end
+    return dst
+end
+
+-- util.phone(number) → string
+-- Normalizes a phone number to digits only ("+55 (11) 98765-4321" → "5511987654321").
+-- Group ids and other non-numeric recipients are returned unchanged.
+function M.phone(number)
+    local s = tostring(number)
+    if re.test("^[+0-9 ()./-]+$", s) then return re.gsub("[^0-9]", s, "") end
+    return s
+end
+
+-- util.is_url(s) → bool
+function M.is_url(s)
+    return type(s) == "string" and (string.starts_with(s, "https://") or string.starts_with(s, "http://"))
+end
+
+-- util.media_object(media [, extra]) → table
+-- A media reference for a message: a URL string becomes {link = url}, any
+-- other string a media id {id = s}; a table is copied. extra's fields
+-- (caption, filename) are added.
+function M.media_object(media, extra)
+    local o = {}
+    if type(media) == "string" then
+        if M.is_url(media) then o.link = media else o.id = media end
+    elseif media ~= nil then
+        M.merge(o, media)
+    end
+    M.merge(o, extra)
+    return o
+end
+
+-- util.multipart(fields, files) → body, content_type
+-- Builds a multipart/form-data body. fields: map name → string;
+-- files: array of {name, filename, content_type, data}.
+function M.multipart(fields, files)
+    local boundary = "----sea-whatsapp-" .. os.token(12)
+    local parts = []
+    if fields ~= nil then
+        local names = list.keys(fields)
+        for _, name in names do
+            parts[] = `--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${fields[name]}\r\n`
+        end
+    end
+    if files ~= nil then
+        for _, f in files do
+            local ct = f.content_type or "application/octet-stream"
+            parts[] = `--${boundary}\r\nContent-Disposition: form-data; name="${f.name}"; filename="${f.filename}"\r\nContent-Type: ${ct}\r\n\r\n`
+            parts[] = f.data
+            parts[] = "\r\n"
+        end
+    end
+    parts[] = `--${boundary}--\r\n`
+    return string.join(parts, ""), "multipart/form-data; boundary=" .. boundary
+end
+
+local MIME = {
+    jpg = "image/jpeg", jpeg = "image/jpeg", png = "image/png", webp = "image/webp",
+    mp4 = "video/mp4", ["3gp"] = "video/3gpp",
+    aac = "audio/aac", amr = "audio/amr", mp3 = "audio/mpeg", m4a = "audio/mp4", ogg = "audio/ogg", opus = "audio/ogg",
+    txt = "text/plain", pdf = "application/pdf",
+    doc = "application/msword", docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xls = "application/vnd.ms-excel", xlsx = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ppt = "application/vnd.ms-powerpoint", pptx = "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
+-- util.mime_type(filename) → string|nil
+-- The MIME type WhatsApp expects for a file extension.
+function M.mime_type(filename)
+    local ext = string.lower(path.ext(filename) or "")
+    if string.starts_with(ext, ".") then ext = string.sub(ext, 2) end
+    return MIME[ext]
+end
+
+return M

@@ -1,0 +1,53 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 03_echo_bot.sea — a webhook server that answers every message
+--
+--   export WA_TOKEN=... WA_PHONE_ID=...
+--   export WA_VERIFY_TOKEN=any-secret-string   # the same in the Meta app's webhook setup
+--   export WA_APP_SECRET=...                   # App settings > Basic (optional, checks signatures)
+--   ../sea_vm/bin/sea examples/03_echo_bot.sea [PORT]
+--
+-- Expose the port over HTTPS (e.g. `cloudflared tunnel --url http://localhost:8080`),
+-- set https://.../webhook as the callback URL and subscribe to the "messages" field.
+
+local http = require("../../sea_vm/libs/http/http")
+local wa = require("../whatsapp")
+
+local port = tonumber(os.args[1] or "8080")
+local client = wa.new({token = os.getenv("WA_TOKEN"), phone_number_id = os.getenv("WA_PHONE_ID"), retries = 2})
+if is_error(client) then
+    io.write_err(client.message, "\n")
+    os.exit(1)
+end
+
+local function answer(msg)
+    client:typing(msg.id)
+    local r = nil
+    if msg.type == "text" then
+        r = client:send_text(msg.from, `Você disse: ${msg.text}`, {reply_to = msg.id})
+    elseif msg.reply ~= nil then
+        r = client:send_text(msg.from, `Você escolheu: ${msg.reply.title} (${msg.reply.id})`)
+    elseif msg.media ~= nil then
+        r = client:send_reaction(msg.from, msg.id, "👍")
+    elseif msg.type == "location" then
+        r = client:send_text(msg.from, `Recebi sua localização: ${msg.location["latitude"]}, ${msg.location["longitude"]}`)
+    else
+        r = client:send_buttons(msg.from, "Não entendi. Quer ajuda?", [{id = "help", title = "Ajuda"}, {id = "bye", title = "Tchau"}])
+    end
+    if is_error(r) then io.write_err("send failed: ", r.message, "\n") end
+end
+
+local router = http.router()
+router.any("/webhook", wa.webhook.handler({
+    verify_token = os.getenv("WA_VERIFY_TOKEN"),
+    app_secret = os.getenv("WA_APP_SECRET"),
+    async = true,
+    on_message = function(msg)
+        print(`<- ${msg.name or "?"} (${msg.from}) [${msg.type}] ${msg.text or ""}`)
+        answer(msg)
+    end,
+    on_status = function(st) print(`   ${st.id} ${st.status}`) end,
+}))
+
+http.serve(port, router, {log = true})

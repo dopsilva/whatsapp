@@ -1,0 +1,35 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 02_send_template.sea — sends a template message (starts a conversation)
+--
+--   export WA_TOKEN=... WA_PHONE_ID=...
+--   ../sea_vm/bin/sea examples/02_send_template.sea 5511999999999
+--
+-- "hello_world" (en_US) exists in every new account. For a template with
+-- parameters, build its components with wa.template:
+--
+--   client:send_template(to, "order_update", "pt_BR", [
+--       wa.template.body("Ana", "#1234", wa.template.currency("BRL", 99.9)),
+--       wa.template.button_url(0, "1234"),
+--   ])
+
+local wa = require("../whatsapp")
+
+local to = os.args[1]
+if to == nil then
+    io.write_err("usage: sea examples/02_send_template.sea NUMBER [TEMPLATE [LANGUAGE]]\n")
+    os.exit(2)
+end
+
+local client = wa.new({token = os.getenv("WA_TOKEN"), phone_number_id = os.getenv("WA_PHONE_ID")})
+if is_error(client) then
+    io.write_err(client.message, "\n")
+    os.exit(1)
+end
+local r = client:send_template(to, os.args[2] or "hello_world", os.args[3] or "en_US")
+if is_error(r) then
+    io.write_err(r.message, "\n")
+    os.exit(1)
+end
+print("template sent:", wa.message_id(r))

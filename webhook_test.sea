@@ -1,0 +1,173 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- webhook_test.sea — tests of webhook verification, signatures, parsing and
+-- the http handler: sea test
+
+local t = require("sea/test")
+local http = require("../sea_vm/libs/http/http")
+local wa = require("./whatsapp")
+
+local webhook = wa.webhook
+local SECRET = "app-secret"
+
+local function notification(value)
+    return json.encode({object = "whatsapp_business_account", entry = [{id = "WABA", changes = [{field = "messages", value = value}]}]})
+end
+
+local META = {display_phone_number = "15550001111", phone_number_id = "1111"}
+local CONTACTS = [{profile = {name = "Ana"}, wa_id = "5511999999999"}]
+
+local function msg(fields)
+    local m = {}
+    m.from = "5511999999999"
+    m.id = "wamid.IN"
+    m.timestamp = "1760000000"
+    for k, v in fields do m[k] = v end
+    return m
+end
+
+local function parse_one(m)
+    local events = webhook.parse(notification({messaging_product = "whatsapp", metadata = META, contacts = CONTACTS, messages = [m]}))
+    t.eq(len(events), 1)
+    return events[0]
+end
+
+t.describe("webhook.verify", function()
+    t.it("answers the challenge with the right token", function()
+        local q = [=]
+        q["hub.mode"] = "subscribe"
+        q["hub.verify_token"] = "tok"
+        q["hub.challenge"] = "12345"
+        t.eq(webhook.verify(q, "tok"), "12345")
+        t.is_nil(webhook.verify(q, "other"))
+        q["hub.mode"] = "x"
+        t.is_nil(webhook.verify(q, "tok"))
+    end)
+end)
+
+t.describe("webhook.valid_signature", function()
+    t.it("checks HMAC-SHA256 of the raw body", function()
+        local body = "{\"a\":1}"
+        local sig = webhook.signature(body, SECRET)
+        t.matches(sig, "^sha256=[0-9a-f]{64}$")
+        t.ok(webhook.valid_signature(body, sig, SECRET))
+        t.no(webhook.valid_signature(body .. " ", sig, SECRET))
+        t.no(webhook.valid_signature(body, sig, "wrong"))
+        t.no(webhook.valid_signature(body, nil, SECRET))
+    end)
+end)
+
+t.describe("webhook.parse", function()
+    t.it("parses text messages", function()
+        local e = parse_one(msg({type = "text", text = {body = "oi"}, context = {from = "x", id = "wamid.OUT"}}))
+        t.eq(e.kind, "message")
+        t.eq(e.type, "text")
+        t.eq(e.text, "oi")
+        t.eq(e.from, "5511999999999")
+        t.eq(e.name, "Ana")
+        t.eq(e.id, "wamid.IN")
+        t.eq(e.timestamp, 1760000000)
+        t.eq(e.phone_number_id, "1111")
+        t.eq(e.reply_to, "wamid.OUT")
+    end)
+
+    t.it("parses media messages", function()
+        local e = parse_one(msg({type = "image", image = {id = "media-9", mime_type = "image/jpeg", caption = "foto"}}))
+        t.eq(e.media["id"], "media-9")
+        t.eq(e.text, "foto")
+    end)
+
+    t.it("parses button and list replies", function()
+        local e = parse_one(msg({type = "interactive", interactive = {type = "button_reply", button_reply = {id = "yes", title = "Sim"}}}))
+        t.eq(e.reply, {type = "button_reply", id = "yes", title = "Sim"})
+        t.eq(e.text, "Sim")
+        e = parse_one(msg({type = "interactive", interactive = {type = "list_reply", list_reply = {id = "1", title = "Mussarela", description = "d"}}}))
+        t.eq(e.reply.id, "1")
+        t.eq(e.reply.description, "d")
+        e = parse_one(msg({type = "button", button = {text = "Parar", payload = "STOP"}}))
+        t.eq(e.reply, {type = "button", id = "STOP", title = "Parar"})
+    end)
+
+    t.it("parses flow answers", function()
+        local e = parse_one(msg({type = "interactive", interactive = {type = "nfm_reply", nfm_reply = {name = "flow", body = "Sent", response_json = "{\"cpf\":\"123\"}"}}}))
+        t.eq(e.reply.type, "flow")
+        t.eq(e.reply.data["cpf"], "123")
+    end)
+
+    t.it("parses location, reactions and contacts", function()
+        t.eq(parse_one(msg({type = "location", location = {latitude = 1.5, longitude = 2}})).location["latitude"], 1.5)
+        t.eq(parse_one(msg({type = "reaction", reaction = {message_id = "wamid.OUT", emoji = "❤️"}})).reaction, {message_id = "wamid.OUT", emoji = "❤️"})
+        t.eq(parse_one(msg({type = "contacts", contacts = [{name = {formatted_name = "Bia"}}]})).contacts[0]["name"]["formatted_name"], "Bia")
+    end)
+
+    t.it("parses statuses and errors", function()
+        local events = webhook.parse(notification({
+            messaging_product = "whatsapp", metadata = META,
+            statuses = [
+                {id = "wamid.OUT", status = "delivered", timestamp = "1760000001", recipient_id = "5511999999999"},
+                {id = "wamid.OUT2", status = "failed", timestamp = "1760000002", recipient_id = "1", errors = [{code = 131047, title = "Re-engagement message"}]},
+            ],
+        }))
+        t.eq(len(events), 2)
+        t.eq(events[0].kind, "status")
+        t.eq(events[0].status, "delivered")
+        t.eq(events[0].timestamp, 1760000001)
+        t.eq(events[1].errors[0]["code"], 131047)
+    end)
+
+    t.it("passes other fields through", function()
+        local p = json.encode({object = "whatsapp_business_account", entry = [{id = "WABA", changes = [{field = "message_template_status_update", value = {event = "APPROVED"}}]}]})
+        local e = webhook.parse(p)[0]
+        t.eq(e.kind, "change")
+        t.eq(e.field, "message_template_status_update")
+        t.eq(e.value["event"], "APPROVED")
+    end)
+
+    t.it("rejects invalid JSON", function()
+        t.is_error(webhook.parse("{nope"))
+    end)
+end)
+
+t.describe("webhook.handler", function()
+    local srv = nil
+    local base = nil
+    local got = []
+
+    t.before_all(function()
+        local h = webhook.handler({
+            verify_token = "tok",
+            app_secret = SECRET,
+            on_message = function(e) got[] = "message:" .. e.text end,
+            on_status = function(e) got[] = "status:" .. e.status end,
+        })
+        srv = http.listen(0, h, {host = "127.0.0.1"})
+        base = `http://127.0.0.1:${srv.port}/webhook`
+    end)
+    t.after_all(function() srv.close() end)
+
+    t.it("verifies the subscription", function()
+        local r = http.get(base, {query = {["hub.mode"] = "subscribe", ["hub.verify_token"] = "tok", ["hub.challenge"] = "777"}})
+        t.eq(r.status, 200)
+        t.eq(r.body, "777")
+        t.eq(http.get(base, {query = {["hub.mode"] = "subscribe", ["hub.verify_token"] = "bad", ["hub.challenge"] = "777"}}).status, 403)
+    end)
+
+    t.it("dispatches signed notifications", function()
+        got = []
+        local body = notification({
+            messaging_product = "whatsapp", metadata = META, contacts = CONTACTS,
+            messages = [msg({type = "text", text = {body = "oi"}})],
+            statuses = [{id = "wamid.OUT", status = "read", timestamp = "1", recipient_id = "1"}],
+        })
+        local r = http.post(base, body, "application/json", {headers = {["X-Hub-Signature-256"] = webhook.signature(body, SECRET)}})
+        t.eq(r.status, 200)
+        t.eq(got, ["message:oi", "status:read"])
+    end)
+
+    t.it("refuses bad signatures", function()
+        local r = http.post(base, "{}", "application/json", {headers = {["X-Hub-Signature-256"] = "sha256=00"}})
+        t.eq(r.status, 401)
+        t.eq(http.post(base, "{}", "application/json").status, 401)
+    end)
+end)

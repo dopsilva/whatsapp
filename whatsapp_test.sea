@@ -1,0 +1,267 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp_test.sea — tests of the WhatsApp client against a fake Graph API
+-- server on loopback (no network or Meta account needed): sea test
+
+local t = require("sea/test")
+local http = require("../sea_vm/libs/http/http")
+local wa = require("./whatsapp")
+
+local PHONE = "1111"
+local WABA = "2222"
+local TOKEN = "test-token"
+
+-- ---- Fake Graph API ------------------------------------------------------------
+
+local fake = {}
+fake.requests = []
+fake.flaky = 0
+
+local function graph_error(status, code, msg)
+    return http.json({error = {message = msg, type = "OAuthException", code = code, error_data = {details = "details of " .. code}, fbtrace_id = "TRACE"}}, status)
+end
+
+local function handle(req)
+    local rec = [=]
+    rec["method"] = req.method
+    rec["path"] = req.path
+    rec["query"] = req.query
+    rec["headers"] = req.headers
+    rec["body"] = req.body
+    if req.headers["content-type"] == "application/json" then rec["json"] = req:json() end
+    fake.requests[] = rec
+    if req.headers["authorization"] ~= "Bearer " .. TOKEN then return graph_error(401, 190, "Invalid OAuth access token") end
+    local p = req.path
+    local m = req.method
+    if m == "POST" and p == `/v23.0/${PHONE}/messages` then
+        local body = req:json()
+        if body["to"] == "000" then return graph_error(400, 131030, "Recipient phone number not in allowed list") end
+        if body["status"] == "read" then return http.json({success = true}) end
+        return http.json({messaging_product = "whatsapp", contacts = [{input = body["to"], wa_id = body["to"]}], messages = [{id = "wamid.TEST"}]})
+    elseif m == "POST" and p == `/v23.0/${PHONE}/media` then
+        return http.json({id = "media-1"})
+    elseif m == "GET" and p == "/v23.0/media-1" then
+        return http.json({id = "media-1", url = fake.base .. "/files/media-1", mime_type = "image/png", file_size = 4})
+    elseif m == "DELETE" and p == "/v23.0/media-1" then
+        return http.json({success = true})
+    elseif m == "GET" and p == "/files/media-1" then
+        return {status = 200, body = "\x89PNG", headers = {["Content-Type"] = "image/png"}}
+    elseif m == "GET" and p == `/v23.0/${WABA}/message_templates` then
+        if req.query["after"] == nil then
+            return http.json({data = [{name = "a"}], paging = {next = fake.base .. `/v23.0/${WABA}/message_templates?after=x`}})
+        end
+        return http.json({data = [{name = "b"}], paging = {}})
+    elseif m == "POST" and p == `/v23.0/${WABA}/message_templates` then
+        return http.json({id = "tpl-1", status = "PENDING", category = req:json()["category"]})
+    elseif m == "DELETE" and p == `/v23.0/${WABA}/message_templates` then
+        return http.json({success = true})
+    elseif m == "GET" and p == `/v23.0/${PHONE}/whatsapp_business_profile` then
+        return http.json({data = [{about = "Sea", messaging_product = "whatsapp"}]})
+    elseif m == "POST" and p == `/v23.0/${PHONE}/whatsapp_business_profile` then
+        return http.json({success = true})
+    elseif m == "POST" and p == `/v23.0/${PHONE}/register` then
+        return http.json({success = true})
+    elseif m == "GET" and p == "/v23.0/flaky" then
+        fake.flaky += 1
+        if fake.flaky < 3 then return graph_error(503, 2, "Service temporarily unavailable") end
+        return http.json({ok = true})
+    end
+    return graph_error(404, 100, "Unknown path " .. p)
+end
+
+local srv = nil
+local client = nil
+
+local function last()
+    return fake.requests[-1]
+end
+
+local function sent()
+    return last()["json"]
+end
+
+t.describe("client", function()
+    t.before_all(function()
+        srv = http.listen(0, handle, {host = "127.0.0.1"})
+        fake.base = `http://127.0.0.1:${srv.port}`
+        client = wa.new({token = TOKEN, phone_number_id = PHONE, waba_id = WABA, base_url = fake.base})
+    end)
+    t.after_all(function() srv.close() end)
+    t.before_each(function() fake.requests = [] end)
+
+    t.it("requires a token", function()
+        t.is_error(wa.new({}), "token is required")
+    end)
+
+    t.it("builds URLs", function()
+        t.eq(client:url("123/messages"), fake.base .. "/v23.0/123/messages")
+        t.eq(client:url("https://x.example/a"), "https://x.example/a")
+    end)
+
+    t.it("sends text", function()
+        local r = t.no_error(client:send_text("+55 (11) 98765-4321", "olá", {preview_url = true, reply_to = "wamid.IN"}))
+        t.eq(wa.message_id(r), "wamid.TEST")
+        t.eq(last()["headers"]["authorization"], "Bearer test-token")
+        local b = sent()
+        t.eq(b["messaging_product"], "whatsapp")
+        t.eq(b["to"], "5511987654321")
+        t.eq(b["type"], "text")
+        t.eq(b["text"]["body"], "olá")
+        t.eq(b["text"]["preview_url"], true)
+        t.eq(b["context"]["message_id"], "wamid.IN")
+    end)
+
+    t.it("turns Graph API errors into error values", function()
+        local r = client:send_text("000", "x")
+        t.is_error(r, "(#131030) Recipient phone number not in allowed list")
+        t.contains(r.message, "HTTP 400")
+        t.contains(r.message, "fbtrace_id TRACE")
+        t.eq(wa.error_code(r), 131030)
+        t.eq(client.last_error.status, 400)
+        t.eq(client.last_error.details, "details of 131030")
+    end)
+
+    t.it("sends media by link or id", function()
+        client:send_image("1", "https://example.com/a.png", {caption = "cap"})
+        t.eq(sent()["image"], {link = "https://example.com/a.png", caption = "cap"})
+        client:send_document("1", "media-1", {filename = "a.pdf"})
+        t.eq(sent()["document"], {id = "media-1", filename = "a.pdf"})
+        client:send_audio("1", "media-2")
+        t.eq(sent()["audio"], {id = "media-2"})
+    end)
+
+    t.it("sends location, contacts and reactions", function()
+        client:send_location("1", {latitude = -23.5, longitude = -46.6, name = "SP"})
+        t.eq(sent()["location"]["name"], "SP")
+        t.is_error(client:send_location("1", {}), "latitude")
+        client:send_contacts("1", [{name = {formatted_name = "Ana"}}])
+        t.eq(sent()["contacts"][0]["name"]["formatted_name"], "Ana")
+        client:send_reaction("1", "wamid.X", "👍")
+        t.eq(sent()["reaction"], {message_id = "wamid.X", emoji = "👍"})
+    end)
+
+    t.it("sends buttons", function()
+        client:send_buttons("1", "Confirma?", ["Sim", {id = "no", title = "Não"}], {header = "Pedido", footer = "rodapé"})
+        local i = sent()["interactive"]
+        t.eq(i["type"], "button")
+        t.eq(i["header"], {type = "text", text = "Pedido"})
+        t.eq(i["body"]["text"], "Confirma?")
+        t.eq(i["footer"]["text"], "rodapé")
+        t.eq(i["action"]["buttons"][0], {type = "reply", reply = {id = "Sim", title = "Sim"}})
+        t.eq(i["action"]["buttons"][1]["reply"]["id"], "no")
+        t.is_error(client:send_buttons("1", "x", ["a", "b", "c", "d"]), "1 to 3")
+    end)
+
+    t.it("sends lists", function()
+        client:send_list("1", "Escolha", "Ver opções", [{title = "Pizzas", rows = [{id = 1, title = "Mussarela", description = "clássica"}]}])
+        local a = sent()["interactive"]["action"]
+        t.eq(a["button"], "Ver opções")
+        t.eq(a["sections"][0]["rows"][0], {id = "1", title = "Mussarela", description = "clássica"})
+        t.is_error(client:send_list("1", "x", "y", [{rows = []}]), "rows")
+    end)
+
+    t.it("sends CTA URL, location request and flows", function()
+        client:send_cta_url("1", "Veja", "Abrir", "https://sea.example")
+        t.eq(sent()["interactive"]["action"]["parameters"]["url"], "https://sea.example")
+        client:send_location_request("1", "Onde você está?")
+        t.eq(sent()["interactive"]["type"], "location_request_message")
+        client:send_flow("1", "Cadastro", {id = "flow-1", cta = "Abrir", token = "tk", screen = "START"})
+        local p = sent()["interactive"]["action"]["parameters"]
+        t.eq(p["flow_id"], "flow-1")
+        t.eq(p["flow_action_payload"]["screen"], "START")
+    end)
+
+    t.it("sends templates with components", function()
+        local tpl = wa.template
+        client:send_template("1", "pedido", "pt_BR", [
+            tpl.header(tpl.image("https://example.com/logo.png")),
+            tpl.body("Ana", 42, tpl.currency("BRL", 99.9)),
+            tpl.button_url(0, "abc"),
+            tpl.button_quick_reply(1, "PARAR"),
+        ])
+        local tm = sent()["template"]
+        t.eq(tm["name"], "pedido")
+        t.eq(tm["language"]["code"], "pt_BR")
+        t.eq(tm["components"][0]["parameters"][0]["image"]["link"], "https://example.com/logo.png")
+        local body = tm["components"][1]["parameters"]
+        t.eq(body[0], {type = "text", text = "Ana"})
+        t.eq(body[1]["text"], "42")
+        t.eq(body[2]["currency"]["amount_1000"], 99900)
+        t.eq(tm["components"][2], {type = "button", sub_type = "url", index = "0", parameters = [{type = "text", text = "abc"}]})
+        t.eq(tm["components"][3]["parameters"][0]["payload"], "PARAR")
+    end)
+
+    t.it("marks messages read and shows typing", function()
+        t.no_error(client:mark_read("wamid.IN"))
+        t.eq(sent(), {messaging_product = "whatsapp", status = "read", message_id = "wamid.IN"})
+        client:typing("wamid.IN")
+        t.eq(sent()["typing_indicator"], {type = "text"})
+    end)
+
+    t.it("uploads media as multipart", function()
+        local r = t.no_error(client:upload_media("foto.png", {data = "\x89PNGdata"}))
+        t.eq(r["id"], "media-1")
+        local req = last()
+        t.matches(req["headers"]["content-type"], "^multipart/form-data; boundary=")
+        t.contains(req["body"], "name=\"messaging_product\"\r\n\r\nwhatsapp\r\n")
+        t.contains(req["body"], "name=\"type\"\r\n\r\nimage/png\r\n")
+        t.contains(req["body"], "filename=\"foto.png\"\r\nContent-Type: image/png\r\n\r\n\x89PNGdata\r\n")
+        t.is_error(client:upload_media("a.xyz", {data = "x"}), "unknown media type")
+    end)
+
+    t.it("gets, downloads and deletes media", function()
+        local info = t.no_error(client:get_media("media-1"))
+        t.eq(info["mime_type"], "image/png")
+        t.eq(last()["query"]["phone_number_id"], PHONE)
+        t.eq(client:download_media("media-1"), "\x89PNG")
+        t.eq(last()["headers"]["authorization"], "Bearer test-token")
+        local dest = fs.tempdir() .. "/m.png"
+        t.eq(client:download_media(info["url"], dest), dest)
+        t.eq(fs.read(dest), "\x89PNG")
+        t.eq(client:delete_media("media-1")["success"], true)
+    end)
+
+    t.it("manages templates", function()
+        local page = client:list_templates()
+        t.eq(page["data"][0]["name"], "a")
+        local all = t.no_error(client:all_templates())
+        t.eq(list.map(all, function(x) return x["name"] end), ["a", "b"])
+        t.is_error(client:create_template({name = "x"}), "required")
+        local r = client:create_template({name = "x", language = "pt_BR", category = "UTILITY", components = [{type = "BODY", text = "Oi"}]})
+        t.eq(r["status"], "PENDING")
+        client:delete_template("x", "tpl-1")
+        t.eq(last()["query"]["name"], "x")
+        t.eq(last()["query"]["hsm_id"], "tpl-1")
+    end)
+
+    t.it("manages the business profile and registration", function()
+        t.eq(client:get_business_profile()["about"], "Sea")
+        t.contains(last()["query"]["fields"], "about")
+        client:update_business_profile({about = "Novo"})
+        t.eq(sent(), {messaging_product = "whatsapp", about = "Novo"})
+        client:register(123456)
+        t.eq(sent()["pin"], "123456")
+    end)
+
+    t.it("needs ids for scoped calls", function()
+        local c = wa.new({token = TOKEN, base_url = fake.base})
+        t.is_error(c:send_text("1", "x"), "phone_number_id")
+        t.is_error(c:list_templates(), "waba_id")
+    end)
+
+    t.it("retries 5xx when configured", function()
+        fake.flaky = 0
+        local c = wa.new({token = TOKEN, base_url = fake.base, retries = 0})
+        t.is_error(c:get("flaky"), "(#2)")
+        fake.flaky = 0
+        c = wa.new({token = TOKEN, base_url = fake.base, retries = 2})
+        t.eq(c:get("flaky")["ok"], true)
+        t.eq(fake.flaky, 3)
+    end)
+
+    t.it("reports network failures", function()
+        local c = wa.new({token = TOKEN, phone_number_id = PHONE, base_url = "http://127.0.0.1:1", timeout = 1000})
+        t.is_error(c:send_text("1", "x"), "whatsapp: POST")
+    end)
+end)

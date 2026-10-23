@@ -1,0 +1,59 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp — a client for Meta's WhatsApp Business Cloud API (Graph API)
+--
+-- Send messages (text, media, location, contacts, reactions, buttons, lists,
+-- CTA URL, flows, templates), manage media, templates, phone numbers and the
+-- business profile, and receive webhooks.
+--
+--   local wa = require("./whatsapp")
+--   local client = wa.new({token = os.getenv("WA_TOKEN"), phone_number_id = os.getenv("WA_PHONE_ID")})?
+--   local r = client:send_text("5511999999999", "Olá do Sea!")?
+--   print(wa.message_id(r))
+--
+-- Every call returns the decoded Graph API answer or an error value
+-- ("whatsapp: (#131030) Recipient phone number not in allowed list (HTTP 400, ...)").
+
+local client = require("./client")
+local messages = require("./messages")
+local media = require("./media")
+local manage = require("./manage")
+
+local M = {}
+
+M.VERSION = "0.1.0"
+M.DEFAULT_VERSION = client.DEFAULT_VERSION
+
+-- whatsapp.new(config) → client|error
+-- config:
+--   token            access token (a System User token in production) — required
+--   phone_number_id  the sender's phone number id (messages, media, profile)
+--   waba_id          the WhatsApp Business Account id (templates, phone numbers)
+--   version          Graph API version (default "v23.0")
+--   base_url         default "https://graph.facebook.com" (tests point it to a fake server)
+--   timeout          per network operation, in ms (default 30000)
+--   retries          extra attempts on network errors, 429 and 5xx (default 0)
+function M.new(config)
+    return client.new(config, [messages, media, manage])
+end
+
+-- whatsapp.message_id(answer) → string|nil
+-- The id of the message sent (answer.messages[0].id).
+function M.message_id(answer)
+    if answer == nil or is_error(answer) then return nil end
+    local msgs = answer["messages"]
+    if msgs == nil or len(msgs) == 0 then return nil end
+    return msgs[0]["id"]
+end
+
+-- whatsapp.error_code(err) → int|nil
+-- The Graph API error code of an error returned by this library (e.g. 131047:
+-- more than 24 hours since the user's last message; send a template).
+M.error_code = client.error_code
+
+M.template = require("./template")
+M.webhook = require("./webhook")
+M.util = require("./util")
+
+return M

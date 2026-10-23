@@ -1,0 +1,69 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/media — uploading, inspecting, downloading and deleting media
+
+local util = require("./util")
+
+local M = {}
+
+-- client:upload_media(file [, opts]) → {id}|error
+-- Uploads a file to WhatsApp and returns {id = "<media id>"}; use the id in
+-- send_image, send_document, ... (uploaded media lasts 30 days).
+-- file: a path, or opts.data holds the bytes (file is then the filename).
+-- opts: data, mime_type (guessed from the extension otherwise), filename.
+function M.upload_media(self, file, opts)
+    local phone_id = self:require_phone()?
+    local data = opts and opts.data
+    if data == nil then data = fs.read(file)? end
+    local filename = (opts and opts.filename) or path.basename(file or "file")
+    local mime = (opts and opts.mime_type) or util.mime_type(filename)
+    if mime == nil then return error("whatsapp: unknown media type of " .. filename .. " (pass opts.mime_type)") end
+    local fields = [=]
+    fields["messaging_product"] = "whatsapp"
+    fields["type"] = mime
+    local body, ct = util.multipart(fields, [{name = "file", filename = filename, content_type = mime, data = data}])
+    return self:request("POST", phone_id .. "/media", {body = body, content_type = ct})
+end
+
+-- client:get_media(media_id) → {url, mime_type, sha256, file_size, id}|error
+-- The temporary download URL (valid for 5 minutes) and metadata of a media id
+-- (from an upload or from a received message).
+function M.get_media(self, media_id)
+    local q = nil
+    if self.phone_number_id ~= nil then
+        q = [=]
+        q["phone_number_id"] = self.phone_number_id
+    end
+    return self:get(media_id, q)
+end
+
+-- client:download_media(url_or_id [, dest]) → bytes|error
+-- Downloads media. Given a media id, looks up its URL first. With dest, the
+-- bytes are written to that file and its path is returned instead.
+function M.download_media(self, ref, dest)
+    local url = ref
+    if not util.is_url(ref) then
+        local info = self:get_media(ref)?
+        url = info["url"]
+    end
+    local r = self:raw_request("GET", url)?
+    if not r.ok then return error(`whatsapp: media download failed: HTTP ${r.status}`) end
+    if dest ~= nil then
+        fs.write(dest, r.body)?
+        return dest
+    end
+    return r.body
+end
+
+-- client:delete_media(media_id) → {success}|error
+function M.delete_media(self, media_id)
+    local q = nil
+    if self.phone_number_id ~= nil then
+        q = [=]
+        q["phone_number_id"] = self.phone_number_id
+    end
+    return self:delete(media_id, q)
+end
+
+return M

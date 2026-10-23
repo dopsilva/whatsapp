@@ -1,0 +1,107 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/template — builders for the components of a template message
+--
+--   local tpl = wa.template
+--   client:send_template(to, "order_update", "pt_BR", [
+--       tpl.header(tpl.image("https://example.com/logo.png")),
+--       tpl.body("Ana", "#1234", tpl.currency("BRL", 99.9)),
+--       tpl.button_url(0, "1234"),
+--   ])
+--
+-- A plain string or number among the parameters is a text parameter.
+
+local util = require("./util")
+
+local M = {}
+
+-- template.text(value [, name]) → parameter
+-- A text parameter; name is the parameter_name of a template with named
+-- parameters ({{customer}}).
+function M.text(value, name)
+    local p = {}
+    p.type = "text"
+    p.text = tostring(value)
+    util.put(p, "parameter_name", name)
+    return p
+end
+
+-- template.currency(code, amount [, fallback]) → parameter
+-- amount in units ("99.9" → amount_1000 = 99900).
+function M.currency(code, amount, fallback)
+    local c = {}
+    c.fallback_value = fallback or string.format("%s %.2f", code, amount)
+    c.code = code
+    c.amount_1000 = math.round(amount * 1000)
+    return {type = "currency", currency = c}
+end
+
+-- template.date_time(fallback) → parameter
+function M.date_time(fallback)
+    return {type = "date_time", date_time = {fallback_value = fallback}}
+end
+
+-- template.image(media) → parameter   (media: URL, media id or {id|link})
+function M.image(media)
+    return {type = "image", image = util.media_object(media)}
+end
+
+-- template.video(media) → parameter
+function M.video(media)
+    return {type = "video", video = util.media_object(media)}
+end
+
+-- template.document(media [, filename]) → parameter
+function M.document(media, filename)
+    return {type = "document", document = util.media_object(media, {filename = filename})}
+end
+
+-- template.location(location) → parameter   ({latitude, longitude, name, address})
+function M.location(location)
+    return {type = "location", location = util.merge({}, location)}
+end
+
+local function params(args)
+    local out = []
+    for _, a in args do
+        local t = type(a)
+        if t == "string" or t == "int" or t == "number" then out[] = M.text(a) else out[] = a end
+    end
+    return out
+end
+
+-- template.body(param, ...) → component
+function M.body(...)
+    return {type = "body", parameters = params([...])}
+end
+
+-- template.header(param, ...) → component
+function M.header(...)
+    return {type = "header", parameters = params([...])}
+end
+
+-- template.button_url(index, suffix) → component
+-- The dynamic part of the URL of button number index (0-based).
+function M.button_url(index, suffix)
+    return {type = "button", sub_type = "url", index = tostring(index), parameters = [M.text(suffix)]}
+end
+
+-- template.button_quick_reply(index, payload) → component
+-- payload comes back in the "button" message when the user taps it.
+function M.button_quick_reply(index, payload)
+    return {type = "button", sub_type = "quick_reply", index = tostring(index), parameters = [{type = "payload", payload = payload}]}
+end
+
+-- template.button_copy_code(index, code) → component
+function M.button_copy_code(index, code)
+    return {type = "button", sub_type = "copy_code", index = tostring(index), parameters = [{type = "coupon_code", coupon_code = code}]}
+end
+
+-- template.button_otp(index, code) → component
+-- The code of an authentication template's copy-code / one-tap button.
+function M.button_otp(index, code)
+    return M.button_url(index, code)
+end
+
+return M

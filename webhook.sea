@@ -1,0 +1,247 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/webhook — receiving WhatsApp webhooks: the verification handshake,
+-- the X-Hub-Signature-256 check, and parsing notifications into flat events.
+--
+--   local srv = http.listen(8080, wa.webhook.handler({
+--       verify_token = os.getenv("WA_VERIFY_TOKEN"),
+--       app_secret = os.getenv("WA_APP_SECRET"),
+--       on_message = function(msg) print(msg.from, msg.text) end,
+--       on_status = function(st) print(st.id, st.status) end,
+--   }))
+
+local util = require("./util")
+
+local M = {}
+
+local function get(t, ...)
+    local v = t
+    for _, k in [...] do
+        if v == nil or type(v) == "string" then return nil end
+        v = v[k]
+    end
+    return v
+end
+
+-- webhook.verify(query, verify_token) → challenge|nil
+-- The answer to Meta's GET verification request: hub.challenge when
+-- hub.mode is "subscribe" and hub.verify_token matches, else nil.
+function M.verify(query, verify_token)
+    if query == nil or verify_token == nil then return nil end
+    if query["hub.mode"] ~= "subscribe" then return nil end
+    local token = query["hub.verify_token"]
+    if token == nil or not hash.equal(token, verify_token) then return nil end
+    return query["hub.challenge"]
+end
+
+-- webhook.signature(body, app_secret) → "sha256=<hex>"
+function M.signature(body, app_secret)
+    return "sha256=" .. hash.hmac("sha256", app_secret, body)
+end
+
+-- webhook.valid_signature(body, header, app_secret) → bool
+-- Checks the X-Hub-Signature-256 header against the raw request body
+-- (HMAC-SHA256 with the app secret), in constant time.
+function M.valid_signature(body, header, app_secret)
+    if header == nil or app_secret == nil or body == nil then return false end
+    return hash.equal(string.lower(string.trim(header)), M.signature(body, app_secret))
+end
+
+local MEDIA_TYPES = {image = true, video = true, audio = true, document = true, sticker = true}
+
+-- The message's main text: body of a text, caption of media, title of a
+-- button/list reply, text of a template quick-reply button.
+local function message_event(m, value, contacts_by_id)
+    local e = {}
+    e.kind = "message"
+    e.type = m["type"]
+    e.id = m["id"]
+    e.from = m["from"]
+    e.timestamp = tonumber(m["timestamp"])
+    e.phone_number_id = get(value, "metadata", "phone_number_id")
+    e.display_phone_number = get(value, "metadata", "display_phone_number")
+    util.put(e, "name", contacts_by_id[m["from"]])
+    local ctx = m["context"]
+    if ctx ~= nil then
+        util.put(e, "reply_to", ctx["id"])
+        util.put(e, "forwarded", ctx["forwarded"])
+    end
+    local t = e.type
+    if t == "text" then
+        e.text = get(m, "text", "body")
+    elseif MEDIA_TYPES[t] then
+        local media = m[t]
+        e.media = media
+        util.put(e, "text", media and media["caption"])
+    elseif t == "interactive" then
+        local i = m["interactive"]
+        local kind = i and i["type"]
+        local r = nil
+        if kind == "button_reply" then
+            r = i["button_reply"]
+        elseif kind == "list_reply" then
+            r = i["list_reply"]
+        elseif kind == "nfm_reply" then
+            local nfm = i["nfm_reply"]
+            local reply = {}
+            reply.type = "flow"
+            util.put(reply, "body", nfm["body"])
+            local resp = nfm["response_json"]
+            if resp ~= nil then util.put(reply, "data", json.decode(resp)) end
+            e.reply = reply
+        end
+        if r ~= nil then
+            local reply = {}
+            reply.type = kind
+            reply.id = r["id"]
+            reply.title = r["title"]
+            util.put(reply, "description", r["description"])
+            e.reply = reply
+            e.text = r["title"]
+        end
+    elseif t == "button" then
+        local b = m["button"]
+        e.text = b and b["text"]
+        e.reply = {type = "button", id = b and b["payload"], title = b and b["text"]}
+    elseif t == "location" then
+        e.location = m["location"]
+    elseif t == "contacts" then
+        e.contacts = m["contacts"]
+    elseif t == "reaction" then
+        e.reaction = {message_id = get(m, "reaction", "message_id"), emoji = get(m, "reaction", "emoji") or ""}
+    elseif t == "order" then
+        e.order = m["order"]
+    elseif t == "system" then
+        e.system = m["system"]
+        util.put(e, "text", get(m, "system", "body"))
+    elseif t == "unsupported" or t == "unknown" then
+        util.put(e, "errors", m["errors"])
+    end
+    util.put(e, "referral", m["referral"])
+    e.raw = m
+    return e
+end
+
+local function status_event(s, value)
+    local e = {}
+    e.kind = "status"
+    e.id = s["id"]
+    e.status = s["status"]
+    e.recipient_id = s["recipient_id"]
+    e.timestamp = tonumber(s["timestamp"])
+    e.phone_number_id = get(value, "metadata", "phone_number_id")
+    util.put(e, "conversation", s["conversation"])
+    util.put(e, "pricing", s["pricing"])
+    util.put(e, "errors", s["errors"])
+    util.put(e, "biz_opaque_callback_data", s["biz_opaque_callback_data"])
+    e.raw = s
+    return e
+end
+
+-- webhook.parse(payload) → events|error
+-- Flattens a notification (a JSON string or the decoded value) into an array
+-- of events, each one of:
+--   {kind = "message", type, id, from, name, timestamp, text, reply, media,
+--    location, contacts, reaction, reply_to, phone_number_id, raw}
+--     text: body of a text, caption of media, title of a button/list reply;
+--     reply: {type, id, title} of interactive and template-button answers
+--     ({type = "flow", data} for a Flow);
+--     media: {id, mime_type, sha256, caption, filename} (download with
+--     client:download_media(msg.media.id))
+--   {kind = "status", id, status ("sent"|"delivered"|"read"|"failed"),
+--    recipient_id, timestamp, errors, conversation, pricing, raw}
+--   {kind = "error", errors, phone_number_id}
+--   {kind = "change", field, value} for other fields (account_update,
+--    message_template_status_update, ...)
+function M.parse(payload)
+    local data = payload
+    if type(payload) == "string" then data = json.decode(payload)? end
+    if data == nil or type(data) == "string" then return error("whatsapp: invalid webhook payload") end
+    local events = []
+    for _, entry in data["entry"] or [] do
+        for _, change in entry["changes"] or [] do
+            local field = change["field"]
+            local value = change["value"]
+            if field ~= "messages" then
+                events[] = {kind = "change", field = field, value = value, waba_id = entry["id"]}
+                continue
+            end
+            local names = [=]
+            for _, c in value["contacts"] or [] do
+                local n = get(c, "profile", "name")
+                if n ~= nil then names[c["wa_id"]] = n end
+            end
+            for _, m in value["messages"] or [] do events[] = message_event(m, value, names) end
+            for _, s in value["statuses"] or [] do events[] = status_event(s, value) end
+            if value["errors"] ~= nil then
+                events[] = {kind = "error", errors = value["errors"], phone_number_id = get(value, "metadata", "phone_number_id")}
+            end
+        end
+    end
+    return events
+end
+
+local function respond(status, body)
+    return {status = status, body = body, headers = {["Content-Type"] = "text/plain; charset=utf-8"}}
+end
+
+-- webhook.handler(opts) → function(req) → response
+-- An http handler (for http.listen / http.serve or a router route) that
+-- answers the verification GET and processes notification POSTs.
+-- opts:
+--   verify_token  the token configured in the Meta app (required for GET)
+--   app_secret    the app secret; when given, POSTs without a valid
+--                 X-Hub-Signature-256 are refused with 401
+--   on_message(event, req), on_status(event, req), on_event(event, req)
+--                 callbacks (on_event gets every event, including errors
+--                 and other fields)
+--   async         true: run the callbacks in a goroutine and answer 200 at
+--                 once (Meta retries webhooks that are slow to answer)
+--   on_error(err, req)  called when a callback panics (default: print it)
+function M.handler(opts)
+    opts = opts or {}
+    local function dispatch(events, req)
+        for _, e in events do
+            if opts.on_event ~= nil then opts.on_event(e, req) end
+            if e.kind == "message" and opts.on_message ~= nil then opts.on_message(e, req) end
+            if e.kind == "status" and opts.on_status ~= nil then opts.on_status(e, req) end
+        end
+    end
+    local function safe_dispatch(events, req)
+        defer function()
+            local err = recover()
+            if err ~= nil then
+                if opts.on_error ~= nil then
+                    opts.on_error(err, req)
+                else
+                    io.write_err("whatsapp webhook: callback failed: ", tostring(err.message or err), "\n")
+                end
+            end
+        end
+        dispatch(events, req)
+    end
+    return function(req)
+        if req.method == "GET" then
+            local challenge = M.verify(req.query, opts.verify_token)
+            if challenge == nil then return respond(403, "forbidden") end
+            return respond(200, challenge)
+        end
+        if req.method ~= "POST" then return respond(405, "method not allowed") end
+        if opts.app_secret ~= nil then
+            if not M.valid_signature(req.body, req.headers["x-hub-signature-256"], opts.app_secret) then
+                return respond(401, "invalid signature")
+            end
+        end
+        local events = M.parse(req.body)
+        if is_error(events) then return respond(400, events.message) end
+        if opts.async then
+            go safe_dispatch(events, req)
+        else
+            safe_dispatch(events, req)
+        end
+        return respond(200, "OK")
+    end
+end
+
+return M

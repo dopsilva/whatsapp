@@ -1,0 +1,201 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/client — the Graph API client core: configuration, requests, errors
+
+local http = require("../sea_vm/libs/http/http")
+local util = require("./util")
+
+local M = {}
+
+M.DEFAULT_VERSION = "v23.0"
+M.DEFAULT_BASE_URL = "https://graph.facebook.com"
+
+local RETRY_STATUS = [=]
+RETRY_STATUS[0] = true
+RETRY_STATUS[429] = true
+RETRY_STATUS[500] = true
+RETRY_STATUS[502] = true
+RETRY_STATUS[503] = true
+RETRY_STATUS[504] = true
+
+-- Methods shared by every client (copied into each object by client.new).
+M.methods = {}
+local C = M.methods
+
+-- client.api_error(status, body) → error, details
+-- Turns a Graph API error response into an error value
+-- ("whatsapp: (#131030) Recipient phone number not in allowed list: ... (HTTP 400, OAuthException, fbtrace_id AbC)")
+-- and a details table {status, code, subcode, type, message, details, fbtrace_id, body}.
+function M.api_error(status, body)
+    local d = {}
+    d.status = status
+    d.body = body
+    local data = nil
+    if type(body) == "string" and body ~= "" then data = json.decode(body) end
+    local e = nil
+    if data ~= nil and not is_error(data) and type(data) ~= "string" then e = data["error"] end
+    if e == nil then
+        d.message = `HTTP ${status} ${http.status_text(status)}`
+        return error("whatsapp: " .. d.message), d
+    end
+    util.put(d, "code", e["code"])
+    util.put(d, "subcode", e["error_subcode"])
+    util.put(d, "type", e["type"])
+    util.put(d, "fbtrace_id", e["fbtrace_id"])
+    d.message = e["message"] or e["error_user_msg"] or "unknown error"
+    local ed = e["error_data"]
+    if ed ~= nil and ed["details"] ~= nil then d.details = ed["details"] end
+    local msg = "whatsapp: "
+    if d.code ~= nil then msg ..= `(#${d.code}) ` end
+    msg ..= d.message
+    if d.details ~= nil and d.details ~= d.message then msg ..= ": " .. d.details end
+    local extra = [`HTTP ${status}`]
+    if d.type ~= nil then extra[] = d.type end
+    if d.fbtrace_id ~= nil then extra[] = "fbtrace_id " .. d.fbtrace_id end
+    msg ..= " (" .. string.join(extra, ", ") .. ")"
+    return error(msg), d
+end
+
+-- client.error_code(err) → int|nil
+-- The Graph API error code in an error value returned by this library
+-- (131030 for "(#131030) ..."), or nil.
+function M.error_code(err)
+    if not is_error(err) then return nil end
+    local c = re.captures("\\(#(\\d+)\\)", err.message)
+    if c == nil then return nil end
+    return tonumber(c[1])
+end
+
+-- client.new(config) → client|error
+-- config: token (required), phone_number_id, waba_id, version ("v23.0"),
+-- base_url ("https://graph.facebook.com"), timeout (ms, 30000),
+-- retries (0: extra attempts on network errors, 429 and 5xx).
+function M.new(config, extra_methods)
+    if config == nil or config.token == nil or config.token == "" then
+        return error("whatsapp: config.token is required")
+    end
+    local self = {}
+    self.token = config.token
+    self.phone_number_id = config.phone_number_id
+    self.waba_id = config.waba_id
+    self.version = config.version or M.DEFAULT_VERSION
+    self.base_url = string.trim(config.base_url or M.DEFAULT_BASE_URL)
+    if string.ends_with(self.base_url, "/") then self.base_url = string.sub(self.base_url, 1, len(self.base_url) - 1) end
+    self.timeout = config.timeout or 30000
+    self.retries = config.retries or 0
+    self.last_error = nil
+    for name, f in C do self[name] = f end
+    if extra_methods ~= nil then
+        for _, methods in extra_methods do
+            for name, f in methods do self[name] = f end
+        end
+    end
+    return self
+end
+
+-- client:url(path) → string
+-- The full URL of a Graph API path ("123/messages" → "https://graph.facebook.com/v23.0/123/messages").
+-- Absolute URLs are returned unchanged.
+function C.url(self, p)
+    if util.is_url(p) then return p end
+    if string.starts_with(p, "/") then p = string.sub(p, 2) end
+    return `${self.base_url}/${self.version}/${p}`
+end
+
+-- client:raw_request(method, path [, opts]) → response|error
+-- Sends an authenticated request and returns the http response, retrying
+-- as configured. opts: json, query, body, content_type, headers, timeout.
+-- Network failures are error values; HTTP error statuses are not.
+function C.raw_request(self, method, p, opts)
+    local headers = {}
+    headers["Authorization"] = "Bearer " .. self.token
+    local o = {}
+    o.timeout = self.timeout
+    if opts ~= nil then
+        util.merge(o, opts)
+        if opts.headers ~= nil then util.merge(headers, opts.headers) end
+    end
+    o.headers = headers
+    local url = self:url(p)
+    local attempt = 0
+    while true do
+        local r = http.request(method, url, o)
+        if not RETRY_STATUS[r.status] or attempt >= self.retries then
+            if r.status == 0 then return error(`whatsapp: ${method} ${url}: ${r.error}`) end
+            return r
+        end
+        local wait = 500 * time.Millisecond * (2 ^ attempt)
+        local after = tonumber(r.headers ~= nil and r.headers["retry-after"] or nil)
+        if after ~= nil then wait = after * time.Second end
+        time.sleep(math.floor(wait))
+        attempt += 1
+    end
+end
+
+-- client:request(method, path [, opts]) → data|error
+-- Like raw_request, but decodes the JSON answer and turns Graph API errors
+-- into error values (their details are kept in client.last_error).
+function C.request(self, method, p, opts)
+    local r = self:raw_request(method, p, opts)?
+    if not r.ok then
+        local err, details = M.api_error(r.status, r.body)
+        self.last_error = details
+        return err
+    end
+    if r.body == "" then return {} end
+    local data = json.decode(r.body)
+    if is_error(data) then return error("whatsapp: invalid JSON response: " .. data.message) end
+    return data
+end
+
+-- client:get(path [, query]) → data|error
+function C.get(self, p, query)
+    return self:request("GET", p, {query = query})
+end
+
+-- client:post(path, value) → data|error
+-- POSTs value as JSON.
+function C.post(self, p, value)
+    return self:request("POST", p, {json = value or {}})
+end
+
+-- client:delete(path [, query]) → data|error
+function C.delete(self, p, query)
+    return self:request("DELETE", p, {query = query})
+end
+
+-- client:require_phone() → phone_number_id|error
+function C.require_phone(self)
+    if self.phone_number_id == nil then return error("whatsapp: phone_number_id is not configured") end
+    return self.phone_number_id
+end
+
+-- client:require_waba() → waba_id|error
+function C.require_waba(self)
+    if self.waba_id == nil then return error("whatsapp: waba_id is not configured") end
+    return self.waba_id
+end
+
+-- client:next_page(data) → next_page|nil|error
+-- The next page of a list answer (data.paging.next), or nil at the end.
+function C.next_page(self, data)
+    if data == nil or data["paging"] == nil or data["paging"]["next"] == nil then return nil end
+    return self:get(data["paging"]["next"])
+end
+
+-- client:all_pages(path [, query]) → items|error
+-- Follows paging.next and returns every item of every page's data.
+function C.all_pages(self, p, query)
+    local items = []
+    local page = self:get(p, query)?
+    while page ~= nil do
+        if page["data"] ~= nil then
+            for _, item in page["data"] do items[] = item end
+        end
+        page = self:next_page(page)?
+    end
+    return items
+end
+
+return M

@@ -1,0 +1,45 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 04_media_and_account.sea — uploads a file, sends it, and shows account info
+--
+--   export WA_TOKEN=... WA_PHONE_ID=... WA_WABA_ID=...
+--   ../sea_vm/bin/sea examples/04_media_and_account.sea 5511999999999 report.pdf
+
+local wa = require("../whatsapp")
+
+local function main(to, file)
+    local client = wa.new({
+        token = os.getenv("WA_TOKEN"),
+        phone_number_id = os.getenv("WA_PHONE_ID"),
+        waba_id = os.getenv("WA_WABA_ID"),
+    })?
+
+    local number = client:get_phone_number()?
+    print("sender:", number["display_phone_number"], number["verified_name"], number["quality_rating"])
+
+    local profile = client:get_business_profile()?
+    print("about:", profile["about"])
+
+    local templates = client:all_templates({status = "APPROVED"})?
+    for _, tpl in templates do print("template:", tpl["name"], tpl["language"], tpl["category"]) end
+
+    if to ~= nil and file ~= nil then
+        local up = client:upload_media(file)?
+        print("uploaded:", up["id"])
+        local mime = wa.util.mime_type(file) or ""
+        local r = nil
+        if string.starts_with(mime, "image/") then
+            r = client:send_image(to, up["id"], {caption = path.basename(file)})?
+        else
+            r = client:send_document(to, up["id"], {filename = path.basename(file)})?
+        end
+        print("sent:", wa.message_id(r))
+    end
+end
+
+local err = main(os.args[1], os.args[2])
+if is_error(err) then
+    io.write_err(err.message, "\n")
+    os.exit(1)
+end

@@ -1,0 +1,35 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- 01_send_text.sea — sends a text, an image and buttons to a number
+--
+--   export WA_TOKEN=...        # access token
+--   export WA_PHONE_ID=...     # phone number id (WhatsApp > API Setup)
+--   ../sea_vm/bin/sea examples/01_send_text.sea 5511999999999
+--
+-- Outside the 24 h window after the user's last message, only templates are
+-- delivered (see 02_send_template.sea).
+
+local wa = require("../whatsapp")
+
+local to = os.args[1]
+if to == nil then
+    io.write_err("usage: sea examples/01_send_text.sea NUMBER\n")
+    os.exit(2)
+end
+
+local function main()
+    local client = wa.new({token = os.getenv("WA_TOKEN"), phone_number_id = os.getenv("WA_PHONE_ID")})?
+    local r = client:send_text(to, "Olá do *Sea*! 🌊")?
+    print("text sent:", wa.message_id(r))
+    r = client:send_image(to, "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg", {caption = "Uma imagem por link"})?
+    print("image sent:", wa.message_id(r))
+    r = client:send_buttons(to, "Gostou?", [{id = "yes", title = "Sim"}, {id = "no", title = "Não"}], {footer = "enviado pelo Sea"})?
+    print("buttons sent:", wa.message_id(r))
+end
+
+local err = main()
+if is_error(err) then
+    io.write_err(err.message, "\n")
+    os.exit(1)
+end

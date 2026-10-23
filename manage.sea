@@ -1,0 +1,146 @@
+-- Copyright (c) 2026 The Sea Authors
+-- SPDX-License-Identifier: BSD-3-Clause
+
+-- whatsapp/manage — account management: message templates (CRUD), phone
+-- numbers (list, register, verification, two-step PIN) and the business profile.
+
+local util = require("./util")
+
+local M = {}
+
+local PROFILE_FIELDS = "about,address,description,email,profile_picture_url,websites,vertical"
+local PHONE_FIELDS = "id,display_phone_number,verified_name,quality_rating,code_verification_status,name_status,platform_type,throughput,status"
+
+-- ---- Templates (WhatsApp Business Account: config.waba_id) ------------------
+
+-- client:list_templates([query]) → {data, paging}|error
+-- One page of the account's message templates. query: name, status
+-- ("APPROVED", "PENDING", "REJECTED"), category, language, limit, fields, after.
+function M.list_templates(self, query)
+    local waba = self:require_waba()?
+    return self:get(waba .. "/message_templates", query)
+end
+
+-- client:all_templates([query]) → templates|error
+-- Every template, following the pages.
+function M.all_templates(self, query)
+    local waba = self:require_waba()?
+    return self:all_pages(waba .. "/message_templates", query)
+end
+
+-- client:get_template(template_id) → template|error
+function M.get_template(self, template_id)
+    return self:get(template_id)
+end
+
+-- client:create_template(template) → {id, status, category}|error
+-- template: {name, language, category ("MARKETING"|"UTILITY"|"AUTHENTICATION"),
+-- components = [{type = "BODY", text = "Olá {{1}}", example = {body_text = [ ["Ana"] ]}}, ...]}.
+function M.create_template(self, template)
+    local waba = self:require_waba()?
+    if template == nil or template.name == nil or template.language == nil or template.category == nil then
+        return error("whatsapp: template.name, template.language and template.category are required")
+    end
+    return self:post(waba .. "/message_templates", template)
+end
+
+-- client:edit_template(template_id, changes) → {success}|error
+-- changes: components and/or category (approved templates can be edited
+-- a limited number of times).
+function M.edit_template(self, template_id, changes)
+    return self:post(template_id, changes)
+end
+
+-- client:delete_template(name [, template_id]) → {success}|error
+-- Deletes every language of the template name, or only the one with template_id.
+function M.delete_template(self, name, template_id)
+    local waba = self:require_waba()?
+    local q = [=]
+    q["name"] = name
+    if template_id ~= nil then q["hsm_id"] = template_id end
+    return self:delete(waba .. "/message_templates", q)
+end
+
+-- ---- Phone numbers ----------------------------------------------------------
+
+-- client:list_phone_numbers([fields]) → {data, paging}|error
+-- The phone numbers of the WhatsApp Business Account (config.waba_id).
+function M.list_phone_numbers(self, fields)
+    local waba = self:require_waba()?
+    local q = [=]
+    q["fields"] = fields or PHONE_FIELDS
+    return self:get(waba .. "/phone_numbers", q)
+end
+
+-- client:get_phone_number([phone_number_id [, fields]]) → info|error
+-- Display number, verified name, quality rating, ... (default: the configured number).
+function M.get_phone_number(self, phone_number_id, fields)
+    local id = phone_number_id or self:require_phone()?
+    local q = [=]
+    q["fields"] = fields or PHONE_FIELDS
+    return self:get(id, q)
+end
+
+-- client:register(pin [, opts]) → {success}|error
+-- Registers the configured number for the Cloud API with a 6-digit two-step
+-- verification PIN. opts.data_localization_region (e.g. "BR").
+function M.register(self, pin, opts)
+    local id = self:require_phone()?
+    local body = {}
+    body.messaging_product = "whatsapp"
+    body.pin = tostring(pin)
+    if opts ~= nil then util.put(body, "data_localization_region", opts.data_localization_region) end
+    return self:post(id .. "/register", body)
+end
+
+-- client:deregister() → {success}|error
+function M.deregister(self)
+    local id = self:require_phone()?
+    return self:post(id .. "/deregister", {})
+end
+
+-- client:request_code([method [, language]]) → {success}|error
+-- Sends a verification code to the number: method "SMS" (default) or "VOICE".
+function M.request_code(self, method, language)
+    local id = self:require_phone()?
+    return self:post(id .. "/request_code", {code_method = method or "SMS", language = language or "en_US"})
+end
+
+-- client:verify_code(code) → {success}|error
+function M.verify_code(self, code)
+    local id = self:require_phone()?
+    return self:post(id .. "/verify_code", {code = tostring(code)})
+end
+
+-- client:set_two_step_pin(pin) → {success}|error
+-- Sets or changes the 6-digit two-step verification PIN.
+function M.set_two_step_pin(self, pin)
+    local id = self:require_phone()?
+    return self:post(id, {pin = tostring(pin)})
+end
+
+-- ---- Business profile --------------------------------------------------------
+
+-- client:get_business_profile([fields]) → profile|error
+-- {about, address, description, email, profile_picture_url, websites, vertical}.
+function M.get_business_profile(self, fields)
+    local id = self:require_phone()?
+    local q = [=]
+    q["fields"] = fields or PROFILE_FIELDS
+    local data = self:get(id .. "/whatsapp_business_profile", q)?
+    if data["data"] ~= nil and len(data["data"]) > 0 then return data["data"][0] end
+    return data
+end
+
+-- client:update_business_profile(fields) → {success}|error
+-- fields: about, address, description, email, websites (array, up to 2),
+-- vertical (e.g. "RETAIL"), profile_picture_handle.
+function M.update_business_profile(self, fields)
+    local id = self:require_phone()?
+    local body = {}
+    body.messaging_product = "whatsapp"
+    util.merge(body, fields)
+    return self:post(id .. "/whatsapp_business_profile", body)
+end
+
+return M
