@@ -2,7 +2,12 @@
 
 Biblioteca em **Sea** para a **WhatsApp Business Cloud API** da Meta (Graph API). Com ela você envia mensagens de todos os tipos, gerencia mídia, templates, números e o perfil comercial, e recebe webhooks com a verificação de assinatura.
 
-Ela é Sea puro e usa a lib `http` do [sea_vm](../sea_vm/libs/http), com HTTPS via `libs/ssl`.
+Ela é Sea puro e usa a lib `http` do sea_vm (`require("http")`), com HTTPS via `libs/ssl`. Em outro projeto, entra pelo `sea.toml` e `sea get`:
+
+```toml
+[dependencies]
+whatsapp = { git = "https://github.com/dopsilva/whatsapp", branch = "main" }
+```
 
 ```sea
 local wa = require("./whatsapp")
@@ -145,7 +150,7 @@ client:all_pages(path, query)
 `wa.webhook.handler(opts)` devolve um handler para `http.listen`, `http.serve` ou uma rota de `http.router()`. Ele responde ao GET de verificação, confere o `X-Hub-Signature-256` quando `app_secret` é informado e transforma cada notificação em eventos planos.
 
 ```sea
-local http = require("../sea_vm/libs/http/http")
+local http = require("http")
 local wa = require("./whatsapp")
 
 http.serve(8080, wa.webhook.handler({

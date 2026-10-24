@@ -3,7 +3,7 @@
 
 -- whatsapp/client — the Graph API client core: configuration, requests, errors
 
-local http = require("../sea_vm/libs/http/http")
+local http = require("http")
 local util = require("./util")
 
 local M = {}

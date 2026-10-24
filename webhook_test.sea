@@ -5,7 +5,7 @@
 -- the http handler: sea test
 
 local t = require("sea/test")
-local http = require("../sea_vm/libs/http/http")
+local http = require("http")
 local wa = require("./whatsapp")
 
 local webhook = wa.webhook
